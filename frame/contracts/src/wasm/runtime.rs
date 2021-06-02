@@ -75,6 +75,9 @@ pub enum ReturnCode {
 	/// recording was disabled.
 	#[cfg(feature = "unstable-interface")]
 	LoggingDisabled = 9,
+	/// The call dispatched by `seal_call_runtime` was executed but returned an error.
+	#[cfg(feature = "unstable-interface")]
+	CallRuntimeReturnedError = 11,
 }
 
 impl ConvertibleToWasm for ReturnCode {
@@ -222,6 +225,9 @@ pub enum RuntimeCosts {
 	ChainExtension(u64),
 	/// Weight charged for copying data from the sandbox.
 	CopyIn(u32),
+	/// Weight charged for calling into the runtime.
+	#[cfg(feature = "unstable-interface")]
+	CallRuntime(Weight),
 }
 
 impl RuntimeCosts {
@@ -291,6 +297,8 @@ impl RuntimeCosts {
 				.saturating_add(s.hash_blake2_128_per_byte.saturating_mul(len.into())),
 			ChainExtension(amount) => amount,
 			CopyIn(len) => s.return_per_byte.saturating_mul(len.into()),
+			#[cfg(feature = "unstable-interface")]
+			CallRuntime(weight) => weight,
 		};
 		RuntimeToken {
 			#[cfg(test)]
@@ -1614,5 +1622,21 @@ define_env!(Env, <E: Ext>,
 		Ok(ctx.write_sandbox_output(
 			out_ptr, out_len_ptr, &rent_status, false, already_charged
 		)?)
+	},
+
+	// Call some dispatchable inside the runtime.
+	[__unstable__] seal_call_runtime(ctx, call_ptr: u32, call_len: u32) -> ReturnCode => {
+		use frame_support::{dispatch::GetDispatchInfo, weights::extract_actual_weight};
+		ctx.charge_gas(RuntimeCosts::CopyIn(call_len))?;
+		let call: <E::T as Config>::Call = ctx.read_sandbox_memory_as(call_ptr, call_len)?;
+		let dispatch_info = call.get_dispatch_info();
+		let charged = ctx.charge_gas(RuntimeCosts::CallRuntime(dispatch_info.weight))?;
+		let result = ctx.ext.call_runtime(call);
+		let actual_weight = extract_actual_weight(&result, &dispatch_info);
+		ctx.adjust_gas(charged, RuntimeCosts::CallRuntime(actual_weight));
+		match result {
+			Ok(_) => Ok(ReturnCode::Success),
+			Err(_) => Ok(ReturnCode::CallRuntimeReturnedError),
+		}
 	},
 );
